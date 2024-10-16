@@ -1,0 +1,108 @@
+// Function to get the last post time by form alias and author
+function fpsm_get_last_post_date_by_form_and_author($post_author_id, $form_alias) {
+    $args = array(
+        'author' => $post_author_id,
+        'meta_query' => array(
+            array(
+                'key' => '_form_alias', // Custom meta field for form alias
+                'value' => $form_alias,
+                'compare' => '='
+            )
+        ),
+        'post_status' => array('publish', 'draft', 'pending', 'future'),
+        'orderby' => 'date',
+        'order' => 'DESC',
+        'posts_per_page' => 1,
+    );
+
+    $query = new WP_Query($args);
+
+    if ($query->have_posts()) {
+        $query->the_post();
+        $last_post_time = get_the_date('Y-m-d') . ' ' . get_the_time('H:i:s');
+        wp_reset_postdata();
+        return $last_post_time;
+    }
+
+    return false;
+}
+
+// Modified function to check time-based post submission limit for multiple forms
+function fpsm_check_time_based_post_limit() {
+    global $fpsm_library_obj;
+
+    if (!isset($_POST['fpsm_nonce']) || !wp_verify_nonce($_POST['fpsm_nonce'], 'fpsm_form_submission')) {
+        wp_die('Security check failed', '', array('response' => 403));
+    }
+
+    $form_data = isset($_POST['form_data']) ? stripslashes_deep($_POST['form_data']) : '';
+    parse_str($form_data, $form_data);
+
+    $form_alias = sanitize_text_field($form_data['form_alias']);
+    $form_row = $fpsm_library_obj->get_form_row_by_alias($form_alias);
+    $form_details = maybe_unserialize($form_row->form_details);
+
+    if ($form_row->form_type == 'login_require' && !empty($form_details['basic']['limit_post_time'])) {
+        if (is_user_logged_in()) {
+            $post_author_id = get_current_user_id();
+            $last_post_time = fpsm_get_last_post_date_by_form_and_author($post_author_id, $form_alias); // Check by form alias
+
+            if ($last_post_time) {
+                $last_post_time_gmt = get_gmt_from_date($last_post_time);
+                $current_time = current_time('timestamp', true);
+                $last_post_time_unix = strtotime($last_post_time_gmt);
+
+                $time_limit_value = intval($form_details['basic']['time_limit_value']);
+                $time_limit_unit = $form_details['basic']['time_limit_unit'];
+                $time_limit_seconds = match ($time_limit_unit) {
+                    'hours' => $time_limit_value * HOUR_IN_SECONDS,
+                    'days' => $time_limit_value * DAY_IN_SECONDS,
+                    'weeks' => $time_limit_value * WEEK_IN_SECONDS,
+                    'months' => $time_limit_value * 30 * DAY_IN_SECONDS,
+                    default => 0,
+                };
+
+                $time_difference = $current_time - $last_post_time_unix;
+
+                if ($time_difference < $time_limit_seconds) {
+                    $remaining_time = $time_limit_seconds - $time_difference;
+                    $days = floor($remaining_time / DAY_IN_SECONDS);
+                    $remaining_time -= $days * DAY_IN_SECONDS;
+
+                    $hours = floor($remaining_time / HOUR_IN_SECONDS);
+                    $remaining_time -= $hours * HOUR_IN_SECONDS;
+
+                    $minutes = floor($remaining_time / MINUTE_IN_SECONDS);
+
+                    $time_to_wait = '';
+                    if ($days > 0) {
+                        $time_to_wait .= sprintf(_n('%s day', '%s days', $days, 'fpsm-time-limit'), $days) . ' ';
+                    }
+                    if ($hours > 0) {
+                        $time_to_wait .= sprintf(_n('%s hour', '%s hours', $hours, 'fpsm-time-limit'), $hours) . ' ';
+                    }
+                    if ($minutes > 0) {
+                        $time_to_wait .= sprintf(_n('%s minute', '%s minutes', $minutes, 'fpsm-time-limit'), $minutes);
+                    }
+
+                    $response = array(
+                        'status' => 403,
+                        'message' => sprintf(__('You can submit a new post again after %s.', 'fpsm-time-limit'), trim($time_to_wait))
+                    );
+                    wp_send_json_error($response);
+                }
+            }
+        }
+    }
+}
+
+// Hook this function to add custom form meta for post submission
+add_action('fpsm_form_submission_success', 'fpsm_save_form_alias_to_post', 10, 3);
+
+function fpsm_save_form_alias_to_post($insert_update_post_id, $form_row, $action) {
+    if ($insert_update_post_id && !empty($form_row['form_alias'])) {
+        // Save the form alias as post meta
+        update_post_meta($insert_update_post_id, '_fpsm_form_alias', sanitize_text_field($form_row['form_alias']));
+    }
+}
+
